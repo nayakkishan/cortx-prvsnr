@@ -17,6 +17,7 @@
 
 from cortx_setup.commands.command import Command
 from cortx_setup.commands.common_utils import (
+    get_cluster_nodes,
     get_reset_states,
     get_pillar_data
 )
@@ -36,8 +37,6 @@ from provisioner.salt import (
 )
 from provisioner.vendor import attr
 from provisioner.commands.destroy import (
-    SetupCtx,
-    RunArgsDestroy,
     DestroyNode
 )
 from provisioner.commands.generate_roster import (
@@ -46,6 +45,7 @@ from provisioner.commands.generate_roster import (
 )
 
 salt_basic_config_script = '/opt/seagate/cortx/provisioner/srv/components/provisioner/scripts/salt.sh'
+
 
 class ClusterResetNode(Command):
     _args = {
@@ -56,10 +56,9 @@ class ClusterResetNode(Command):
         }
     }
 
+    # Creates salt roster file and salt-ssh connection
     def _create_saltssh_client(self):
-        """
-        Creates salt roster file and salt-ssh connection
-        """
+
         salt_config_master = '/etc/salt/master'
         roster_file = f'{BACKUP_FACTORY_FOLDER}/roster'
 
@@ -67,7 +66,8 @@ class ClusterResetNode(Command):
         roster_params['roster_path'] = roster_file
         GenerateRoster().run(**roster_params)
 
-        self.ssh_client = DestroyNode._create_ssh_client(salt_config_master, roster_file)
+        self.ssh_client = DestroyNode._create_ssh_client(
+            salt_config_master, roster_file)
 
     def _apply_states(self, states: list, targets=None):
         try:
@@ -85,7 +85,7 @@ class ClusterResetNode(Command):
             )
             raise
 
-    def _run_cmd(self, cmds : list, targets=None):
+    def _run_cmd(self, cmds: list, targets=None):
         for cmd in cmds:
             self.logger.info(f"Running command {cmd} ")
             try:
@@ -111,14 +111,15 @@ class ClusterResetNode(Command):
                         f"Running {state} for ALL_MINIONS"
                     )
                     deploy.Deploy()._apply_state(
-                        f'components.{state}', targets= ALL_MINIONS, stages=stage
-                    )
+                        f'components.{state}', targets=ALL_MINIONS, stages=stage)
                 except Exception as ex:
                     raise ex
 
     @staticmethod
     def cluster_stop():
-        res = cmd_run('cortx cluster stop --all', targets=local_minion_id())
+        res = cmd_run(
+            'cortx cluster stop --all || true ',
+            targets=local_minion_id())
         return next(iter(res.values()))
 
     @staticmethod
@@ -127,18 +128,17 @@ class ClusterResetNode(Command):
         return next(iter(res.values()))
 
     def run(self, **kwargs):
-        reset_type= kwargs.get('type')
+        reset_type = kwargs.get('type')
         cortx_components = get_reset_states()
-        self.node_list = get_pillar_data('cluster/node_list')
+        non_cortx_components = get_pillar_data('reset/non_cortx_components')
+        self.node_list = get_cluster_nodes()
 
-        self.logger.info(f"Reset to be done for type is {reset_type}")
+        self.logger.debug(f"Reset to be done for type is {reset_type}")
 
-        self.logger.info("Stopping the cluster")
+        self.logger.debug("Stopping the cluster")
         self.cluster_stop()
 
         self._create_saltssh_client()
- 
-        self.logger.info("Calling reset for cortx components")
 
         if reset_type == 'data':
             self.logger.info("Calling reset data for cortx components")
@@ -155,11 +155,24 @@ class ClusterResetNode(Command):
             self.logger.info("Done")
 
         elif reset_type == 'all':
-            self.logger.info("Performing post Factory reset for Cortx components.")
-            self._destroy(cortx_components, stage=["teardown.reset", "teardown.cleanup"])
+            self.logger.debug(
+                "Performing post Factory reset for Cortx components.")
+            self._destroy(
+                cortx_components,
+                stage=[
+                    "teardown.reset",
+                    "teardown.cleanup"])
 
+            self.logger.debug("Preparing Reset for non-Cortx components")
+
+            self._destroy(
+                non_cortx_components,
+                stage=[
+                    "teardown"
+                ]
+            )
             self.logger.debug("Preparing Reset for Provisioner commands")
-            
+
             provisioner_components = [
                 "provisioner.salt.stop",
                 "system.storage.glusterfs.teardown.volume_remove",
@@ -170,20 +183,31 @@ class ClusterResetNode(Command):
 
             self._apply_states(provisioner_components, self.node_list)
 
+            self.logger.debug("Removing cluster id file")
+            self._run_cmd(['chattr -i /etc/cluster-id',
+                           'rm -rf /etc/cluster-id'], self.node_list)
+
             self.logger.debug("Performing provisioner cleanup")
-            self._run_cmd(list(map(lambda el: el + 'rm -rf ', CLEANUP_FILE_LIST)), self.node_list)
+            self._run_cmd(list(map(lambda el: 'rm -rf ' + str(el),
+                                   CLEANUP_FILE_LIST)), self.node_list)
 
             self.logger.debug("Configuring salt at node level")
-            self._run_cmd([f'sh {salt_basic_config_script}'])
+            self._run_cmd([f'sh {salt_basic_config_script}'], self.node_list)
 
             self.logger.debug("Restoring provisioner backed-up files")
-            for key,val in BACKUP_FILE_DICT.items():
+            for key, val in BACKUP_FILE_DICT.items():
                 if 'hosts' not in key:
-                    self._run_cmd([f'yes | cp -rf {str(val)} {key}'])
-                
-            self._run_cmd([f'systemctl restart salt-minion salt-master'])
+                    self._run_cmd(
+                        [f'yes | cp -rf {str(val)} {str(key)}'],
+                        self.node_list)
+
+            self._run_cmd(
+                ['systemctl restart salt-minion salt-master'],
+                self.node_list)
 
             # This is bit risky
-            self._run_cmd([f'yes | cp -rf {BACKUP_FILE_DICT}/hosts /etc/hosts'])
+            self._run_cmd(
+                [f'yes | cp -rf {BACKUP_FILE_DICT}/hosts /etc/hosts'])
             self._run_cmd(['rm -rf /root/.ssh'], self.node_list)
             self.logger.debug("Done")
+
