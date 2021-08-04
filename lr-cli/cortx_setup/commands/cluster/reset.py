@@ -136,6 +136,8 @@ class ClusterResetNode(Command):
         self.logger.info("Stopping the cluster")
         self.cluster_stop()
 
+        self._create_saltssh_client()
+ 
         self.logger.info("Calling reset for cortx components")
 
         if reset_type == 'data':
